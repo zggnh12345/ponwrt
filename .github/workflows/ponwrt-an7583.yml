@@ -99,15 +99,18 @@ jobs:
           MIRROR: ${{ inputs.feeds_mirror }}
         run: |
           set -euo pipefail
+          # 镜像只作用于本次上游 clone，绝不写进全局 config，
+          # 否则 feeds（如 vernesong/OpenClash）也会被套上镜像前缀并可能 403。
+          GIT_MIRROR=()
           if [ -n "${MIRROR}" ]; then
-            git config --global url."${MIRROR}https://github.com/".insteadOf "https://github.com/"
-            echo "[clone] 使用镜像 ${MIRROR}"
+            GIT_MIRROR=(-c "url.${MIRROR}https://github.com/.insteadOf=https://github.com/")
+            echo "[clone] 使用镜像 ${MIRROR}（仅本次 clone）"
           fi
           git init -q src
           cd src
           git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
           # blobless 克隆：拿到全部 commit/tree，按需拉 blob，明显快于全量
-          git fetch -q --filter=blob:none --no-tags origin \
+          git "${GIT_MIRROR[@]}" fetch -q --filter=blob:none --no-tags origin \
             '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
           git -c advice.detachedHead=false checkout -q --detach "${UPSTREAM_REF}" \
             || { echo "::error::上游不存在 ref ${UPSTREAM_REF}"; exit 1; }
@@ -125,10 +128,56 @@ jobs:
 
       - name: feeds update / install
         working-directory: orchestrator/src
+        env:
+          MIRROR: ${{ inputs.feeds_mirror }}
+          # 这些 feed 走加速镜像会 403 / 内容不一致，强制直连
+          MIRROR_SKIP: "vernesong/OpenClash"
         run: |
-          set -euo pipefail
-          ./scripts/feeds update -a
+          set -uo pipefail
+          [ -f feeds.conf ] || cp feeds.conf.default feeds.conf
+          cp feeds.conf feeds.conf.orig
+
+          if [ -n "${MIRROR}" ]; then
+            # 逐行加镜像前缀，命中黑名单的行保持直连
+            while IFS= read -r line; do
+              case "$line" in
+                ""|"#"*) printf '%s\n' "$line"; continue ;;
+              esac
+              skip=0
+              for pat in ${MIRROR_SKIP}; do
+                case "$line" in *"$pat"*) skip=1 ;; esac
+              done
+              if [ "$skip" = "1" ]; then
+                printf '%s\n' "$line"
+              else
+                printf '%s\n' "$line" | sed -E "s#(https://)#${MIRROR}\\1#g"
+              fi
+            done < feeds.conf.orig > feeds.conf
+            echo "[feeds] 已按镜像改写 feeds.conf（黑名单直连：${MIRROR_SKIP}）"
+          fi
+
+          echo "--- feeds update ---"
+          if ! ./scripts/feeds update -a; then
+            echo "::warning::走镜像 feed update 失败，回退全部直连重试"
+            cp feeds.conf.orig feeds.conf
+            ./scripts/feeds update -a
+          fi
+
+          echo "--- 每个 feed 落地校验（比 install -a 的报错更可读）---"
+          MISSING=0
+          while read -r kw name url _; do
+            case "${kw:-}" in
+              src-*) [ -d "feeds/${name}" ] || { echo "::error::feed '${name}' 未落地（${url}）"; MISSING=1; } ;;
+            esac
+          done < feeds.conf
+          if [ "$MISSING" != "0" ]; then
+            echo "--- feeds 目录现状 ---"; ls -1 feeds 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "--- feeds install ---"
           ./scripts/feeds install -a
+
           echo "--- 关键 feed 检查 ---"
           test -d feeds/pon_userspace/luci-app-onu || { echo "::error::feeds/pon_userspace/luci-app-onu 不存在，feed 源可能已变更"; ls feeds; exit 1; }
 
