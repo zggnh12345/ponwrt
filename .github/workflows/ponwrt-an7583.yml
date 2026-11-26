@@ -242,10 +242,16 @@ jobs:
           set -euo pipefail
           OUT="$RUNNER_TEMP/artifacts"
           mkdir -p "$OUT"
-          cp -v bin/targets/airoha/*/*sysupgrade* "$OUT"/ 2>/dev/null || true
-          cp -v bin/targets/airoha/*/*.itb "$OUT"/ 2>/dev/null || true
-          cp -v bin/targets/airoha/*/sha256sums "$OUT"/ 2>/dev/null || true
-          cp -v bin/targets/airoha/*/profiles.json "$OUT"/ 2>/dev/null || true
+          shopt -s nullglob
+          # 全量拷贝 target 输出目录：含 *sysupgrade*/*.itb/factory-*/bl31-uboot.fip/preloader.bin/manifest/buildinfo
+          # 不再用窄通配符，避免 bootloader 与 factory 镜像被漏掉
+          for d in bin/targets/airoha/*/; do
+            for f in "$d"*; do
+              [ -f "$f" ] || continue
+              case "$f" in */packages/*) continue ;; esac
+              cp -f "$f" "$OUT"/
+            done
+          done
           cp -v .config "$OUT/config.used"
           cp -v build.log "$OUT/build.log"
           ( cd "$OUT" && ls -lh )
@@ -260,6 +266,17 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
           test -n "$(ls -A "$OUT"/*.bin 2>/dev/null)" || echo "::warning::未找到 .bin 镜像，请查看 build.log"
+
+          echo "--- 产物完整性自检（对照 sha256sums）---"
+          if [ -f "$OUT/sha256sums" ]; then
+            ( cd "$OUT" && sha256sum -c sha256sums 2>&1 | tee /tmp/sumcheck.txt )
+            if grep -q 'FAILED' /tmp/sumcheck.txt; then
+              echo "::error::产物与 sha256sums 不一致或有缺失"; exit 1
+            fi
+            echo "[collect] sha256sums 全部匹配"
+          else
+            echo "::warning::未找到 sha256sums，跳过自检"
+          fi
         env:
           TARGET_PROFILE: ${{ inputs.target }}
 
