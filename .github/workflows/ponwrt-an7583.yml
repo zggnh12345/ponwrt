@@ -1,0 +1,225 @@
+name: ponwrt-an7583
+
+# 云端编译 uioprr/ponwrt 的 Airoha AN7583 固件（Nokia XG-040G-MF）
+# 本仓库只放「编排 + 补丁」，源码在 runner 内现场 clone，不占用户仓库体积。
+# 手动触发：Actions -> ponwrt-an7583 -> Run workflow（可选 REST API，见 scripts/ci-trigger.sh）
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repo:
+        description: "上游仓库 owner/name"
+        required: true
+        default: "uioprr/ponwrt"
+      upstream_ref:
+        description: "上游 commit / tag / 分支（默认锁定 51bcee4）"
+        required: true
+        default: "51bcee4"
+      target:
+        description: "目标 profile（an7583 出 nokia_xg-040g-mf）"
+        required: true
+        default: "an7583"
+      plugin_layer:
+        description: "full = 底板+release.config 全量插件；base = 仅底板"
+        type: choice
+        options:
+          - full
+          - base
+        default: full
+      jobs:
+        description: "并行度（4 vCPU runner 建议 4，勿超 6）"
+        required: true
+        default: "4"
+      feeds_mirror:
+        description: "GitHub 加速前缀，留空则直连"
+        required: false
+        default: "https://ghfast.top/"
+      keep_pon_package:
+        description: "勾选则跳过 luci-app-pon -> luci-app-onu 改名补丁（仅调试用）"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ponwrt-${{ inputs.target }}
+  cancel-in-progress: false
+
+env:
+  CI_PATCH_DIR: ${{ github.workspace }}/orchestrator/ci
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 420
+
+    steps:
+      - name: 清理 runner 磁盘（腾出约 25G）
+        run: |
+          set -x
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/share/boost \
+                      /usr/share/swift /usr/lib/jvm 2>/dev/null || true
+          sudo apt-get clean
+          df -h /
+
+      - name: 取回编排仓库（workflow + ci/ 补丁）
+        uses: actions/checkout@v4
+        with:
+          path: orchestrator
+          fetch-depth: 1
+
+      - name: 安装编译依赖
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+            gettext git libncurses-dev libssl-dev rsync unzip zlib1g-dev file \
+            wget curl cpio subversion swig libelf-dev bc quilt python3 python3-setuptools \
+            perl time ccache
+          gcc --version | head -1
+          nproc; free -g | head -2
+
+      - name: 缓存 ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ inputs.target }}-${{ inputs.upstream_ref }}-${{ github.run_id }}
+          restore-keys: |
+            ccache-${{ inputs.target }}-${{ inputs.upstream_ref }}-
+            ccache-${{ inputs.target }}-
+
+      - name: clone 上游源码（按需走加速镜像）
+        id: clone
+        working-directory: orchestrator
+        env:
+          UPSTREAM_REPO: ${{ inputs.upstream_repo }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          MIRROR: ${{ inputs.feeds_mirror }}
+        run: |
+          set -euo pipefail
+          if [ -n "${MIRROR}" ]; then
+            git config --global url."${MIRROR}https://github.com/".insteadOf "https://github.com/"
+            echo "[clone] 使用镜像 ${MIRROR}"
+          fi
+          git init -q src
+          cd src
+          git remote add origin "https://github.com/${UPSTREAM_REPO}.git"
+          # blobless 克隆：拿到全部 commit/tree，按需拉 blob，明显快于全量
+          git fetch -q --filter=blob:none --no-tags origin \
+            '+refs/heads/*:refs/remotes/origin/*' '+refs/tags/*:refs/tags/*'
+          git -c advice.detachedHead=false checkout -q --detach "${UPSTREAM_REF}" \
+            || { echo "::error::上游不存在 ref ${UPSTREAM_REF}"; exit 1; }
+          HEAD_SHA="$(git rev-parse HEAD)"
+          SHORT_SHA="$(git rev-parse --short=12 HEAD)"
+          echo "PONWRT_HEAD=${HEAD_SHA}" >> "$GITHUB_ENV"
+          echo "head=${HEAD_SHA}"   >> "$GITHUB_OUTPUT"
+          echo "short=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+          git log -1 --format='%h %ad %s' --date=short
+
+      - name: 打 luci-app-pon -> luci-app-onu 改名补丁
+        if: ${{ !inputs.keep_pon_package }}
+        run: |
+          bash orchestrator/ci/scripts/apply-patch.sh orchestrator/src "${{ inputs.target }}"
+
+      - name: feeds update / install
+        working-directory: orchestrator/src
+        run: |
+          set -euo pipefail
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          echo "--- 关键 feed 检查 ---"
+          test -d feeds/pon_userspace/luci-app-onu || { echo "::error::feeds/pon_userspace/luci-app-onu 不存在，feed 源可能已变更"; ls feeds; exit 1; }
+
+      - name: 生成 .config（底板 ⊗ 定制层）
+        working-directory: orchestrator/src
+        env:
+          TARGET_PROFILE: ${{ inputs.target }}
+          PLUGIN_LAYER: ${{ inputs.plugin_layer }}
+        run: |
+          set -euo pipefail
+          test -f "configs/${TARGET_PROFILE}.config" || { echo "::error::缺少 configs/${TARGET_PROFILE}.config"; ls configs | head -30; exit 1; }
+          if [ "${PLUGIN_LAYER}" = "full" ]; then
+            ./scripts/kconfig.pl + "configs/${TARGET_PROFILE}.config" configs/release.config > .config
+          else
+            cp "configs/${TARGET_PROFILE}.config" .config
+          fi
+          wc -l .config
+          grep -c '=y$' .config || true
+
+      - name: make defconfig
+        working-directory: orchestrator/src
+        run: |
+          set -euo pipefail
+          grep -q '^CONFIG_CCACHE=y' .config || echo 'CONFIG_CCACHE=y' >> .config
+          make defconfig
+          cp .config .config.defconfig
+          echo "defconfig 后 =y 数量: $(grep -c '=y$' .config)"
+
+      - name: 符号校验（防 defconfig 静默裁包）
+        working-directory: orchestrator/src
+        env:
+          PRESET: ${{ inputs.plugin_layer }}
+        run: bash "$CI_PATCH_DIR/scripts/verify-config.sh" .config
+
+      - name: 预下载源码包
+        working-directory: orchestrator/src
+        continue-on-error: true
+        run: make -j"${{ inputs.jobs }}" download || echo "::warning::部分包下载失败，编译阶段会重试"
+
+      - name: 编译
+        working-directory: orchestrator/src
+        env:
+          JOBS: ${{ inputs.jobs }}
+        run: |
+          set -o pipefail
+          export CCACHE_DIR="$HOME/.ccache"
+          ccache -M 2G >/dev/null 2>&1 || true
+          /usr/bin/time -v make -j"${JOBS}" 2>&1 | tee build.log | tail -n 40
+          rc=${PIPESTATUS[0]}
+          if [ "$rc" -ne 0 ]; then
+            echo "::error::编译失败，尾部错误："
+            grep -nE "Error [0-9]|error:|No rule to make" build.log | tail -n 30 || true
+            echo "=== 最近 60 行 ==="
+            tail -n 60 build.log
+            exit "$rc"
+          fi
+
+      - name: 收集产物
+        id: collect
+        working-directory: orchestrator/src
+        run: |
+          set -euo pipefail
+          OUT="$RUNNER_TEMP/artifacts"
+          mkdir -p "$OUT"
+          cp -v bin/targets/airoha/*/*sysupgrade* "$OUT"/ 2>/dev/null || true
+          cp -v bin/targets/airoha/*/*.itb "$OUT"/ 2>/dev/null || true
+          cp -v bin/targets/airoha/*/sha256sums "$OUT"/ 2>/dev/null || true
+          cp -v bin/targets/airoha/*/profiles.json "$OUT"/ 2>/dev/null || true
+          cp -v .config "$OUT/config.used"
+          cp -v build.log "$OUT/build.log"
+          ( cd "$OUT" && ls -lh )
+          {
+            echo "## PonWrt ${TARGET_PROFILE} 编译结果"
+            echo ""
+            echo "- 上游：${{ inputs.upstream_repo }} @ \`${PONWRT_HEAD}\`"
+            echo "- 配置层：${{ inputs.plugin_layer }} / target \`${{ inputs.target }}\`"
+            echo ""
+            echo '```'
+            ( cd "$OUT" && ls -lh )
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+          test -n "$(ls -A "$OUT"/*.bin 2>/dev/null)" || echo "::warning::未找到 .bin 镜像，请查看 build.log"
+        env:
+          TARGET_PROFILE: ${{ inputs.target }}
+
+      - name: 上传产物
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ponwrt-${{ inputs.target }}-${{ steps.clone.outputs.short || 'unknown' }}-run${{ github.run_number }}
+          path: ${{ runner.temp }}/artifacts
+          if-no-files-found: warn
+          retention-days: 14
+          compression-level: 1
